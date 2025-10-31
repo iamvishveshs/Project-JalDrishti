@@ -225,21 +225,30 @@ streamlit run app.py
 
 ## 🧑‍💻 Authors
 
-**Vishvesh Shivam**
-Student | Web Developer | Founder of [TheVsHub.in](https://www.thevshub.in)
+**Vishvesh Shivam**  
+Student | Web Developer | Founder of [TheVsHub.in](https://www.thevshub.in)  
 📧 [iamvishveshs@gmail.com](mailto:iamvishveshs@gmail.com)
-**Akshay Kumar**
-Student | CSE[AIML]
+
+
+**Akshay Kumar**  
+Student | CSE[AIML]  
 📧 [LinkedIn](https://www.linkedin.com/in/akshaykumar0405))
-**Abhay Rana**
-Student | CSE[AIML]
+
+
+**Abhay Rana**  
+Student | CSE[AIML]  
 📧 [LinkedIn](https://www.linkedin.com/in/abhayranaa/)
-**Ayush Sharma**
-Student | CSE[AIML]
+
+
+**Ayush Sharma**  
+Student | CSE[AIML]  
 📧 [LinkedIn](https://www.linkedin.com/in/ayush-sharma-student)
-**Aayush Chauhan**
-Student | CSE[AIML]
-📧 [LinkedIn](https://www.linkedin.com/in/aayush-chauhan-804269303)
+
+
+**Aayush Chauhan**  
+Student | CSE[AIML]  
+📧 [LinkedIn](https://www.linkedin.com/in/aayush-chauhan-804269303)  
+
 
 ---
 
