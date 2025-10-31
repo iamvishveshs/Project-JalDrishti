@@ -12,10 +12,26 @@ import threading
 import requests
 from collections import deque
 import sys
+from streamlit_webrtc import VideoProcessorBase, webrtc_streamer, WebRtcMode
+import av
+
+
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning)
 
 st.set_page_config(page_title="Flood Detection System", layout="wide")
 
+
 LOCATION_ID = "Sundernagar"
+
+
+try:
+    TELEGRAM_BOT_TOKEN = st.secrets["TELEGRAM_BOT_TOKEN"]
+    DISTRICT_CHANNEL_MAP = st.secrets["district_channel_map"]
+except KeyError as e:
+    st.error(f"FATAL ERROR: Missing key {e} in /.streamlit/secrets.toml!")
+    st.stop()
+
 
 LOCATION_TO_DISTRICT_MAP = {
     # Mandi District
@@ -73,23 +89,8 @@ LOCATION_TO_DISTRICT_MAP = {
 
 TARGET_DISTRICT_NAME = LOCATION_TO_DISTRICT_MAP.get(LOCATION_ID)
 TARGET_CHANNEL_ID = None
-
-
-try:
-    if TARGET_DISTRICT_NAME:
-
-        TARGET_CHANNEL_ID = st.secrets["district_channel_map"].get(TARGET_DISTRICT_NAME)
-
-
-    if "TELEGRAM_BOT_TOKEN" not in st.secrets or not st.secrets["TELEGRAM_BOT_TOKEN"]:
-        st.error("FATAL ERROR: 'TELEGRAM_BOT_TOKEN' not found in Streamlit Secrets!")
-        st.stop()
-
-except Exception as e:
-    st.error(f"FATAL ERROR: Could not read secrets. Make sure /.streamlit/secrets.toml exists and is valid.")
-    st.error(f"Details: {e}")
-    st.stop()
-
+if TARGET_DISTRICT_NAME:
+    TARGET_CHANNEL_ID = DISTRICT_CHANNEL_MAP.get(TARGET_DISTRICT_NAME)
 
 if not TARGET_DISTRICT_NAME:
     st.error(f"FATAL ERROR: Location ID '{LOCATION_ID}' not found in LOCATION_TO_DISTRICT_MAP!")
@@ -105,8 +106,6 @@ st.sidebar.success(f"📍 Monitoring: {LOCATION_ID}")
 st.sidebar.info(f"📣 Alerts go to: {TARGET_DISTRICT_NAME} channel")
 st.sidebar.markdown("---")
 
-
-
 st.title(f"Real-Time Flood Detection: {LOCATION_ID}")
 st.markdown("""
 *Hybrid AI-based flood detection with:*
@@ -117,7 +116,7 @@ st.markdown("""
 """)
 
 st.sidebar.header("Analysis Configuration")
-mode = st.sidebar.radio("Select Mode", ["Video File", "Live Webcam"])
+mode = st.sidebar.radio("Select Mode", ["Live Webcam", "Video File"]) # Webcam first
 cnn_threshold = st.sidebar.slider("CNN Threshold", 0.3, 1.0, 0.85, 0.05)
 speed_threshold = st.sidebar.slider("Speed Threshold (km/h)", 0.5, 5.0, 2.0, 0.1)
 brown_threshold = st.sidebar.slider("Brown Color Threshold (%)", 5, 50, 20, 1)
@@ -174,12 +173,11 @@ class FloodCNN(nn.Module):
 def load_models():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     try:
-        # Using the hardcoded path from your previous code
-        model_yolo = YOLO(".//best.pt")
+        model_yolo = YOLO("best.pt") # Assumes models are in the root
         model_cnn = FloodCNN(input_channels=3).to(device)
         model_cnn.load_state_dict(torch.load('flood_classifier_model.pth', map_location=device))
         model_cnn.eval()
-        st.sidebar.success("AI Models Loaded")
+        st.sidebar.success("✅ AI Models Loaded")
         return model_yolo, model_cnn, device
     except Exception as e:
         st.sidebar.error(f"Error loading models: {e}")
@@ -189,7 +187,6 @@ def load_models():
 model_yolo, model_cnn, device = load_models()
 if model_yolo is None:
     st.stop()
-
 
 
 class AlertManager:
@@ -202,18 +199,19 @@ class AlertManager:
     def trigger_alert(self):
         self.last_alert_time = time.time()
 
+
 if 'alert_manager' not in st.session_state:
     st.session_state.alert_manager = AlertManager(cooldown_seconds=alert_cooldown)
 
+
+alert_lock = threading.Lock()
+
 def send_telegram_alert(specific_location, district_name, target_channel_id, status_message):
     """Sends urgent, highlighted bilingual messages to the specified DISTRICT channel ID."""
-
-
     token = st.secrets.get("TELEGRAM_BOT_TOKEN")
     if not token:
-        st.sidebar.error("Telegram Bot Token is not set in secrets!")
+        print("ERROR: Telegram Bot Token is not set in secrets!")
         return
-
 
     try:
         percent_str = status_message.split(' ')[0]
@@ -243,39 +241,31 @@ Evacuate low-lying areas near the river *NOW!* Seek higher ground immediately.
 
 ⚠️ *आवश्यक कार्रवाई: सुरक्षित स्थान पर जाएँ। नदी के पास न जाएँ।* ⚠️
 """
-
-
     url = f"https://api.telegram.org/bot{token}/sendMessage"
-
-
     try:
         payload_en = {"chat_id": target_channel_id, "text": text_en, "parse_mode": "Markdown"}
-        response_en = requests.post(url, json=payload_en, timeout=10)
-        if response_en.status_code == 200: st.sidebar.success(f"EN alert sent to {district_name}.")
-        else: st.sidebar.warning(f"Failed EN alert ({district_name}): {response_en.text}")
-
+        requests.post(url, json=payload_en, timeout=10)
         time.sleep(0.5)
         payload_hi = {"chat_id": target_channel_id, "text": text_hi, "parse_mode": "Markdown"}
-        response_hi = requests.post(url, json=payload_hi, timeout=10)
-        if response_hi.status_code == 200: st.sidebar.success(f"HI alert sent to {district_name}.")
-        else: st.sidebar.warning(f"Failed HI alert ({district_name}): {response_hi.text}")
+        requests.post(url, json=payload_hi, timeout=10)
+        print(f"Alert sent to {district_name} channel.") # Log to console
     except Exception as e:
-        st.sidebar.error(f"Error sending Telegram alert: {e}")
+        print(f"Error sending Telegram alert: {e}") # Log to console
 
 def trigger_alert(specific_location, district_name, target_channel_id, status_message):
-    """Triggers bilingual alert (NO SOUND)."""
-    if not st.session_state.alert_manager.can_alert():
-        return
+    """Thread-safe alert trigger (NO SOUND)."""
+    with alert_lock:
+        if not st.session_state.alert_manager.can_alert():
+            return # Respect cooldown
+        st.session_state.alert_manager.trigger_alert()
 
-    st.session_state.alert_manager.trigger_alert()
-
+    # Run in a new thread
     telegram_thread = threading.Thread(
         target=send_telegram_alert,
         args=(specific_location, district_name, target_channel_id, status_message),
         daemon=True
     )
     telegram_thread.start()
-
 
 def show_flood_alert():
     st.error("🚨 FLOOD DETECTED! 🚨", icon="⚠")
@@ -317,7 +307,119 @@ def process_frame(frame, mask, speed_kmh, confidence, status, color):
     return display_frame
 
 
-if mode == "Video File":
+class FloodVideoProcessor(VideoProcessorBase):
+    def __init__(self):
+        self.prev_gray = None
+        self.frame_history = deque(maxlen=history_length_frames)
+        self.alert_sent = False
+        self.frame_num = 0
+        self.start_time = time.time()
+
+        self.cnn_threshold = cnn_threshold
+        self.speed_threshold = speed_threshold
+        self.brown_threshold = brown_threshold
+        self.frame_skip = frame_skip
+
+        self.lower_brown = np.array([5, 50, 50])
+        self.upper_brown = np.array([25, 255, 200])
+
+    def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
+        frame = frame.to_ndarray(format="bgr24")
+
+        self.frame_num += 1
+        is_flood_frame = False
+
+        mask = np.zeros((frame.shape[0], frame.shape[1]), dtype=np.uint8)
+        status = "Initializing..."
+        color = (200, 200, 200)
+        speed_kmh = 0.0
+        confidence = 0.0
+
+        if self.frame_num % self.frame_skip == 0:
+            results = model_yolo.predict(frame, imgsz=640, verbose=False, conf=0.3)
+            mask = get_merged_mask(results, frame.shape)
+
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+            if self.prev_gray is None:
+                self.prev_gray = gray
+
+                return av.VideoFrame.from_ndarray(frame, format="bgr24")
+
+            flow = cv2.calcOpticalFlowFarneback(self.prev_gray, gray, None, 0.5, 3, 15, 3, 5, 1.2, 0)
+            flow_masked = flow * mask[..., None]
+            status = "Normal"
+            color = (0, 255, 0)
+
+            if np.any(mask):
+                mag, ang = cv2.cartToPolar(flow_masked[..., 0], flow_masked[..., 1])
+                mean_speed_px = np.mean(mag[mask > 0])
+
+                elapsed = time.time() - self.start_time
+                fps_actual = (self.frame_num / self.frame_skip) / elapsed if elapsed > 0 else 30
+                speed_kmh = mean_speed_px * 0.05 * fps_actual * 3.6
+
+                river_pixels = cv2.bitwise_and(frame, frame, mask=mask.astype(np.uint8))
+                hsv = cv2.cvtColor(river_pixels, cv2.COLOR_BGR2HSV)
+                brown_mask = cv2.inRange(hsv, lower_brown, self.upper_brown)
+                total_river = np.sum(mask)
+                brown_ratio = np.sum(brown_mask > 0) / total_river * 100 if total_river > 0 else 0
+
+                cnn_is_flood, confidence = classify_flood_region(frame, mask, threshold=self.cnn_threshold)
+
+                if cnn_is_flood:
+                    status = "Flood Detected"
+                    color = (0, 0, 255)
+                    is_flood_frame = True
+                elif speed_kmh > self.speed_threshold and brown_ratio > self.brown_threshold:
+                    status = "Flood Detected"
+                    color = (0, 0, 255)
+                    is_flood_frame = True
+                else:
+                    status = "Normal River"
+                    color = (0, 255, 0)
+
+            self.prev_gray = gray
+            self.frame_history.append(is_flood_frame)
+
+            if len(self.frame_history) == self.frame_history.maxlen: # Check if deque is full
+                flood_count = sum(self.frame_history)
+                current_flood_pct = (flood_count / self.frame_history.maxlen) * 100
+
+                if current_flood_pct >= flood_percentage_threshold:
+                    if not self.alert_sent:
+                        self.alert_sent = True
+
+                        print(f"ALERT TRIGGERED: {current_flood_pct}% flood frames.")
+                        trigger_alert(
+                            specific_location=LOCATION_ID,
+                            district_name=TARGET_DISTRICT_NAME,
+                            target_channel_id=TARGET_CHANNEL_ID,
+                            status_message=f"{current_flood_pct:.0f}% of recent frames"
+                        )
+                elif current_flood_pct < (flood_percentage_threshold - 20):
+                    self.alert_sent = False
+
+
+        display_frame = process_frame(frame, mask, speed_kmh, confidence, status, color)
+
+
+        return av.VideoFrame.from_ndarray(display_frame, format="bgr24")
+
+
+if mode == "Live Webcam":
+    st.subheader("Live Webcam Detection")
+    st.markdown("Click **START** to open your webcam. The processed video will appear below.")
+
+    webrtc_streamer(
+        key="live-webcam",
+        mode=WebRtcMode.SENDRECV,
+        video_processor_factory=FloodVideoProcessor,
+        media_stream_constraints={"video": True, "audio": False},
+        async_processing=True,
+    )
+
+elif mode == "Video File":
     st.subheader("Upload Video File")
     uploaded_video = st.file_uploader("Choose a video file", type=['mp4', 'avi', 'mov', 'mkv'])
     if uploaded_video:
@@ -330,12 +432,12 @@ if mode == "Video File":
         fps = cap.get(cv2.CAP_PROP_FPS); width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)); frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         st.info(f"Video: {width}x{height} @ {fps:.1f} fps | History: {history_length_frames} frames | Threshold: {flood_percentage_threshold}%")
-        output_video_path = f"output_flood_detection_{int(time.time())}.avi"
-        fourcc = cv2.VideoWriter_fourcc(*"XVID"); out = cv2.VideoWriter(output_video_path, fourcc, fps, (width, height))
+
         col1, col2 = st.columns([3, 1])
         with col1: frame_placeholder = st.image([])
         with col2: st.subheader("Stats"); stats_placeholder = st.empty()
         alert_placeholder = st.empty(); progress_bar = st.progress(0); status_text = st.empty()
+
         flood_frames = 0; normal_frames = 0; frame_num = 0; prev_gray = None
         lower_brown = np.array([5, 50, 50]); upper_brown = np.array([25, 255, 200])
         start_time = time.time()
@@ -345,20 +447,23 @@ if mode == "Video File":
             ret, frame = cap.read();
             if not ret: break
             frame_num += 1; is_flood_frame = False
+
+            processing_frame = frame.copy()
+
             if frame_num % frame_skip == 0:
-                results = model_yolo.predict(frame, imgsz=640, verbose=False, conf=0.3)
-                mask = get_merged_mask(results, frame.shape)
-                if prev_gray is None: prev_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY); continue
-                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                results = model_yolo.predict(processing_frame, imgsz=640, verbose=False, conf=0.3)
+                mask = get_merged_mask(results, processing_frame.shape)
+                if prev_gray is None: prev_gray = cv2.cvtColor(processing_frame, cv2.COLOR_BGR2GRAY); continue
+                gray = cv2.cvtColor(processing_frame, cv2.COLOR_BGR2GRAY)
                 flow = cv2.calcOpticalFlowFarneback(prev_gray, gray, None, 0.5, 3, 15, 3, 5, 1.2, 0)
                 flow_masked = flow * mask[..., None]; status = "Normal"; color = (0, 255, 0); speed_kmh = 0.0; confidence = 0.0
                 if np.any(mask):
                     mag, ang = cv2.cartToPolar(flow_masked[..., 0], flow_masked[..., 1]); mean_speed_px = np.mean(mag[mask > 0])
                     speed_kmh = mean_speed_px * 0.05 * fps * 3.6
-                    river_pixels = cv2.bitwise_and(frame, frame, mask=mask.astype(np.uint8))
+                    river_pixels = cv2.bitwise_and(processing_frame, processing_frame, mask=mask.astype(np.uint8))
                     hsv = cv2.cvtColor(river_pixels, cv2.COLOR_BGR2HSV); brown_mask = cv2.inRange(hsv, lower_brown, upper_brown)
                     total_river = np.sum(mask); brown_ratio = np.sum(brown_mask > 0) / total_river * 100 if total_river > 0 else 0
-                    cnn_is_flood, confidence = classify_flood_region(frame, mask, threshold=cnn_threshold)
+                    cnn_is_flood, confidence = classify_flood_region(processing_frame, mask, threshold=cnn_threshold)
                     if cnn_is_flood: status = "Flood Detected"; color = (0, 0, 255); flood_frames += 1; is_flood_frame = True
                     elif speed_kmh > speed_threshold and brown_ratio > brown_threshold: status = "Flood Detected"; color = (0, 0, 255); flood_frames += 1; is_flood_frame = True
                     else: status = "Normal"; color = (0, 255, 0); normal_frames += 1
@@ -377,27 +482,33 @@ if mode == "Video File":
                         )
                     elif current_flood_pct < (flood_percentage_threshold - 20):
                         alert_sent_in_video = False; alert_placeholder.empty()
-            display_frame = process_frame(frame, mask, speed_kmh, confidence, status, color); out.write(display_frame)
-            if frame_num % 5 == 0: frame_placeholder.image(cv2.cvtColor(display_frame, cv2.COLOR_BGR2RGB))
+
+            display_frame = process_frame(frame, mask, speed_kmh, confidence, status, color)
+            frame_placeholder.image(cv2.cvtColor(display_frame, cv2.COLOR_BGR2RGB))
+
             if frame_num % 10 == 0:
                 with stats_placeholder.container():
                     st.metric("Flood", flood_frames); st.metric("Normal", normal_frames)
                     if (flood_frames + normal_frames) > 0: rate = (flood_frames / (flood_frames + normal_frames)) * 100; st.metric("Rate", f"{rate:.1f}%")
+
             progress = frame_num / frame_count; progress_bar.progress(progress)
+
             if frame_num % frame_skip != 0 or len(frame_history) < history_length_frames:
                 elapsed = time.time() - start_time; fps_actual = frame_num / elapsed if elapsed > 0 else 0
                 eta = (frame_count - frame_num) / fps_actual if fps_actual > 0 else 0
-                status_text.write(f"Frame: {frame_num}/{frame_count} | {progress*100:.1f}% | {fps_actual:.1f} fps | ETA: {eta:.0f}s")
-        cap.release(); out.release(); elapsed_total = time.time() - start_time
+                if fps_actual > 0:
+                    status_text.write(f"Frame: {frame_num}/{frame_count} | {progress*100:.1f}% | {fps_actual:.1f} fps | ETA: {eta:.0f}s")
+                else:
+                    status_text.write(f"Frame: {frame_num}/{frame_count} | {progress*100:.1f}% | (Calculating ETA...)")
+
+        cap.release()
+        elapsed_total = time.time() - start_time
 
         st.divider(); st.subheader("Results")
         col1, col2, col3, col4 = st.columns(4)
-        with col1:
-            st.metric("Total Frames", frame_num)
-        with col2:
-            st.metric("Flood Frames", flood_frames)
-        with col3:
-            st.metric("Normal Frames", normal_frames)
+        with col1: st.metric("Total Frames", frame_num)
+        with col2: st.metric("Flood Frames", flood_frames)
+        with col3: st.metric("Normal Frames", normal_frames)
         with col4:
             if (flood_frames + normal_frames) > 0:
                 rate = (flood_frames / (flood_frames + normal_frames)) * 100
@@ -408,91 +519,9 @@ if mode == "Video File":
         st.write(f"Processing time: {elapsed_total:.1f} seconds")
         if alert_sent_in_video: st.error("⚠ FLOOD WAS DETECTED IN THIS VIDEO")
         else: st.success("✓ No flood detected in this video")
-        st.subheader("Download Processed Video")
-        if os.path.exists(output_video_path):
-            with open(output_video_path, "rb") as video_file:
-                st.download_button(label="Download Processed Video", data=video_file.read(), file_name=output_video_path, mime="video/avi")
-            st.success(f"Video saved: {output_video_path}")
+
         try: os.unlink(input_video_path)
         except Exception as e: st.warning(f"Could not delete temp file {input_video_path}: {e}")
-
-
-else:
-    st.subheader("Live Webcam Detection")
-    col1, col2 = st.columns([3, 1])
-    with col1: frame_placeholder = st.image([])
-    with col2: st.subheader("Live Stats"); stats_placeholder = st.empty()
-    alert_placeholder = st.empty(); status_text_webcam = st.empty()
-    start_button = st.button("Start Real-Time Detection", key="start_detection")
-    stop_button = st.button("Stop Detection", key="stop_detection")
-    if start_button:
-        st.session_state.detecting = True
-        st.session_state.alert_manager = AlertManager(cooldown_seconds=alert_cooldown)
-        st.session_state.frame_history = deque(maxlen=history_length_frames)
-        st.session_state.alert_sent = False
-    if stop_button: st.session_state.detecting = False
-    if "detecting" not in st.session_state: st.session_state.detecting = False
-    if st.session_state.detecting:
-        cap = cv2.VideoCapture(0)
-        if not cap.isOpened(): st.error("Cannot access webcam")
-        else:
-            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640); cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480); cap.set(cv2.CAP_PROP_FPS, 30)
-            fps = cap.get(cv2.CAP_PROP_FPS); width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)); height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-            st.info(f"Webcam: {width}x{height} @ {fps} fps | History: {history_length_frames} frames | Threshold: {flood_percentage_threshold}%")
-            flood_frames = 0; normal_frames = 0; frame_num = 0; prev_gray = None
-            lower_brown = np.array([5, 50, 50]); upper_brown = np.array([25, 255, 200])
-            start_time = time.time()
-            mask = np.zeros((height, width), dtype=np.uint8); status = "Initializing..."; color = (200, 200, 200); speed_kmh = 0.0; confidence = 0.0
-
-            while st.session_state.detecting:
-                ret, frame = cap.read();
-                if not ret: st.error("Failed to capture frame"); break
-                frame_num += 1; is_flood_frame = False
-                if frame_num % frame_skip == 0:
-                    results = model_yolo.predict(frame, imgsz=640, verbose=False, conf=0.3)
-                    mask = get_merged_mask(results, frame.shape)
-                    if prev_gray is None: prev_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY); continue
-                    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                    flow = cv2.calcOpticalFlowFarneback(prev_gray, gray, None, 0.5, 3, 15, 3, 5, 1.2, 0)
-                    flow_masked = flow * mask[..., None]; status = "Normal"; color = (0, 255, 0); speed_kmh = 0.0; confidence = 0.0
-                    if np.any(mask):
-                        mag, ang = cv2.cartToPolar(flow_masked[..., 0], flow_masked[..., 1]); mean_speed_px = np.mean(mag[mask > 0])
-                        speed_kmh = mean_speed_px * 0.05 * fps * 3.6
-                        river_pixels = cv2.bitwise_and(frame, frame, mask=mask.astype(np.uint8))
-                        hsv = cv2.cvtColor(river_pixels, cv2.COLOR_BGR2HSV); brown_mask = cv2.inRange(hsv, lower_brown, upper_brown)
-                        total_river = np.sum(mask); brown_ratio = np.sum(brown_mask > 0) / total_river * 100 if total_river > 0 else 0
-                        cnn_is_flood, confidence = classify_flood_region(frame, mask, threshold=cnn_threshold)
-                        if cnn_is_flood: status = "Flood Detected"; color = (0, 0, 255); flood_frames += 1; is_flood_frame = True
-                        elif speed_kmh > speed_threshold and brown_ratio > brown_threshold: status = "Flood Detected"; color = (0, 0, 255); flood_frames += 1; is_flood_frame = True
-                        else: status = "Normal River"; color = (0, 255, 0); normal_frames += 1
-                    prev_gray = gray
-                    if 'frame_history' not in st.session_state: st.session_state.frame_history = deque(maxlen=history_length_frames)
-                    st.session_state.frame_history.append(is_flood_frame)
-                    if len(st.session_state.frame_history) == history_length_frames:
-                        flood_count = sum(st.session_state.frame_history); current_flood_pct = (flood_count / history_length_frames) * 100
-                        elapsed = time.time() - start_time; fps_actual = (frame_num / frame_skip) / elapsed if elapsed > 0 else 0
-                        status_text_webcam.write(f"Frame: {frame_num} | {fps_actual:.1f} fps | Flood %: {current_flood_pct:.0f}%")
-                        if current_flood_pct >= flood_percentage_threshold:
-                            if not st.session_state.alert_sent:
-                                st.session_state.alert_sent = True
-                                with alert_placeholder.container(): show_flood_alert()
-                                trigger_alert(
-                                    specific_location=LOCATION_ID,
-                                    district_name=TARGET_DISTRICT_NAME,
-                                    target_channel_id=TARGET_CHANNEL_ID,
-                                    status_message=f"{current_flood_pct:.0f}% of recent frames"
-                                )
-                        elif current_flood_pct < (flood_percentage_threshold - 20):
-                            st.session_state.alert_sent = False; alert_placeholder.empty()
-                display_frame = process_frame(frame, mask, speed_kmh, confidence, status, color)
-                frame_placeholder.image(cv2.cvtColor(display_frame, cv2.COLOR_BGR2RGB))
-                with stats_placeholder.container():
-                    st.metric("Flood Frames", flood_frames); st.metric("Normal Frames", normal_frames)
-                    if (flood_frames + normal_frames) > 0: rate = (flood_frames / (flood_frames + normal_frames)) * 100; st.metric("Flood Rate", f"{rate:.1f}%")
-                if 'frame_history' in st.session_state and len(st.session_state.frame_history) < history_length_frames:
-                    elapsed = time.time() - start_time; fps_actual = (frame_num / frame_skip) / elapsed if elapsed > 0 else 0
-                    status_text_webcam.write(f"Frame: {frame_num} | {fps_actual:.1f} fps | Status: {status} (Buffering history...)")
-            cap.release(); st.info("Detection stopped")
 
 st.divider()
 st.markdown("""
