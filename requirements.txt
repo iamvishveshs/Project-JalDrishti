@@ -5,3 +5,5 @@ torchvision
 ultralytics
 requests
 python-telegram-bot
+streamlit-webrtc
+av
