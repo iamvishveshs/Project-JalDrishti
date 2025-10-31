@@ -1,0 +1,7 @@
+streamlit
+opencv-python
+torch
+torchvision
+ultralytics
+requests
+python-telegram-bot
