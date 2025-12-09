@@ -255,7 +255,7 @@ Student | CSE[AIML]
 ## 🪪 License
 
 This project is released under the **MIT License**.
-Feel free to use, modify, and distribute with attribution.
+See the [LICENSE](LICENSE) file for details.
 
 ---
 
